@@ -10,6 +10,7 @@ static struct config {
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
+    uint64_t rate;
     bool     delay;
     bool     dynamic;
     bool     latency;
@@ -100,11 +101,14 @@ int main(int argc, char **argv) {
     }
 
     cfg.host = host;
+    double throughput    = (double)cfg.rate / cfg.threads;
+    fprintf(stdout, "throughput per thread %f %ld\n", throughput, cfg.threads);
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t      = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = cfg.connections / cfg.threads;
+        t->throughput = throughput;
 
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
@@ -201,13 +205,16 @@ int main(int argc, char **argv) {
 
 void *thread_main(void *arg) {
     thread *thread = arg;
-
+    aeEventLoop *loop = thread->loop;
     char *request = NULL;
     size_t length = 0;
 
     if (!cfg.dynamic) {
         script_request(thread->L, &request, &length);
     }
+
+    double throughput = (thread->throughput / 1000000.0) / thread->connections;
+    fprintf(stdout, "throughput per connection %f %ld\n", throughput, thread->connections);
 
     thread->cs = zcalloc(thread->connections * sizeof(connection));
     connection *c = thread->cs;
@@ -217,11 +224,15 @@ void *thread_main(void *arg) {
         c->ssl     = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
         c->request = request;
         c->length  = length;
+        c->throughput = throughput;
+        c->catch_up_throughput = throughput * 2;
         c->delayed = cfg.delay;
-        connect_socket(thread, c);
+        c->complete   = 0;
+        c->caught_up  = true;
+        // Stagger connects 5 msec apart within thread:
+        aeCreateTimeEvent(loop, i * 5, delayed_initial_connect, c, NULL);
     }
 
-    aeEventLoop *loop = thread->loop;
     aeCreateTimeEvent(loop, RECORD_INTERVAL_MS, record_rate, thread, NULL);
 
     thread->start = time_us();
@@ -268,6 +279,13 @@ static int reconnect_socket(thread *thread, connection *c) {
     sock.close(c);
     close(c->fd);
     return connect_socket(thread, c);
+}
+
+static int delayed_initial_connect(aeEventLoop *loop, long long id, void *data) {
+    connection* c = data;
+    c->thread_start = time_us();
+    connect_socket(c->thread, c);
+    return AE_NOMORE;
 }
 
 static int record_rate(aeEventLoop *loop, long long id, void *data) {
@@ -321,6 +339,47 @@ static int response_body(http_parser *parser, const char *at, size_t len) {
     return 0;
 }
 
+static uint64_t usec_to_next_send(connection *c) {
+    uint64_t now = time_us();
+
+    uint64_t next_start_time = c->thread_start + (c->complete / c->throughput);
+
+    bool send_now = true;
+
+    if (next_start_time > now) {
+        // We are on pace. Indicate caught_up and don't send now.
+        c->caught_up = true;
+        send_now = false;
+    } else {
+        // We are behind
+        if (c->caught_up) {
+            // This is the first fall-behind since we were last caught up
+            c->caught_up = false;
+            c->catch_up_start_time = now;
+            c->complete_at_catch_up_start = c->complete;
+        }
+
+        // Figure out if it's time to send, per catch up throughput:
+        uint64_t complete_since_catch_up_start =
+                c->complete - c->complete_at_catch_up_start;
+
+        next_start_time = c->catch_up_start_time +
+                (complete_since_catch_up_start / c->catch_up_throughput);
+
+        if (next_start_time > now) {
+            // Not yet time to send, even at catch-up throughout:
+            send_now = false;
+        }
+    }
+
+    if (send_now) {
+        c->latest_should_send_time = now;
+        c->latest_expected_start = next_start_time;
+    }
+
+    return send_now ? 0 : (next_start_time - now);
+}
+
 static int response_complete(http_parser *parser) {
     connection *c = parser->data;
     thread *thread = c->thread;
@@ -348,6 +407,7 @@ static int response_complete(http_parser *parser) {
         aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
     }
 
+    c->complete++;
     if (!http_should_keep_alive(parser)) {
         reconnect_socket(thread, c);
         goto done;
@@ -393,6 +453,18 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     }
 
     if (!c->written) {
+        uint64_t time_usec_to_wait = usec_to_next_send(c);
+        if (time_usec_to_wait) {
+            int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
+
+            // Not yet time to send. Delay:
+            aeDeleteFileEvent(loop, fd, AE_WRITABLE);
+            aeCreateTimeEvent(
+                    thread->loop, msec_to_wait, delay_request, c, NULL);
+            return;
+        }
+        c->latest_write = time_us();
+    
         if (cfg.dynamic) {
             script_request(thread->L, &c->request, &c->length);
         }
@@ -476,6 +548,7 @@ static struct option longopts[] = {
     { "timeout",     required_argument, NULL, 'T' },
     { "help",        no_argument,       NULL, 'h' },
     { "version",     no_argument,       NULL, 'v' },
+    { "rate",        required_argument, NULL, 'R' },
     { NULL,          0,                 NULL,  0  }
 };
 
@@ -488,8 +561,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->connections = 10;
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
+    cfg->rate        = 0;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -513,6 +587,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 if (scan_time(optarg, &cfg->timeout)) return -1;
                 cfg->timeout *= 1000;
                 break;
+            case 'R':
+                if (scan_metric(optarg, &cfg->rate)) return -1;
+                break;
             case 'v':
                 printf("wrk %s [%s] ", VERSION, aeGetApiName());
                 printf("Copyright (C) 2012 Will Glozer\n");
@@ -534,6 +611,12 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
 
     if (!cfg->connections || cfg->connections < cfg->threads) {
         fprintf(stderr, "number of connections must be >= threads\n");
+        return -1;
+    }
+
+    if (cfg->rate == 0) {
+        fprintf(stderr,
+                "Throughput MUST be specified with the --rate or -R option\n");
         return -1;
     }
 

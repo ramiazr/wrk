@@ -33,6 +33,7 @@ typedef struct {
     uint64_t requests;
     uint64_t bytes;
     uint64_t start;
+    double throughput;
     lua_State *L;
     errors errors;
     struct connection *cs;
@@ -53,6 +54,13 @@ typedef struct connection {
     int fd;
     SSL *ssl;
     bool delayed;
+    double throughput;
+    double catch_up_throughput;
+    uint64_t complete;
+    uint64_t complete_at_last_batch_start;
+    uint64_t catch_up_start_time;
+    uint64_t complete_at_catch_up_start;
+    uint64_t thread_start;
     uint64_t start;
     char *request;
     size_t length;
@@ -61,6 +69,14 @@ typedef struct connection {
     buffer headers;
     buffer body;
     char buf[RECVBUF];
+    uint64_t actual_latency_start;
+    bool has_pending;
+    bool caught_up;
+    // Internal tracking numbers (used purely for debugging):
+    uint64_t latest_should_send_time;
+    uint64_t latest_expected_start;
+    uint64_t latest_connect;
+    uint64_t latest_write;
 } connection;
 
 #endif /* WRK_H */
