@@ -54,6 +54,10 @@ static void usage() {
            "        --latency          Print latency statistics   \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
+           "    -R, --rate        <T>  work rate (throughput)     \n"
+           "                           in requests/sec (total)    \n"
+           "                           [Required Parameter]       \n"
+           "                                                      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
