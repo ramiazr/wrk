@@ -8,6 +8,7 @@ static struct config {
     uint64_t connections;
     uint64_t duration;
     uint64_t threads;
+    uint64_t threads_delay;
     uint64_t timeout;
     uint64_t pipeline;
     uint64_t rate;
@@ -54,9 +55,12 @@ static void usage() {
            "        --latency          Print latency statistics   \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
-           "    -R, --rate        <T>  work rate (throughput)     \n"
+           "    -R, --rate        <T>  Work rate (throughput)     \n"
            "                           in requests/sec (total)    \n"
            "                           [Required Parameter]       \n"
+           "    -P, --phase       <P>  Delay between each thread  \n"
+           "                           start, default 1           \n"
+
            "                                                      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
@@ -133,6 +137,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
             exit(2);
         }
+        sleep(cfg.threads_delay);
     }
 
     struct sigaction sa = {
@@ -468,7 +473,7 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
             return;
         }
         c->latest_write = time_us();
-    
+
         if (cfg.dynamic) {
             script_request(thread->L, &c->request, &c->length);
         }
@@ -553,6 +558,7 @@ static struct option longopts[] = {
     { "help",        no_argument,       NULL, 'h' },
     { "version",     no_argument,       NULL, 'v' },
     { "rate",        required_argument, NULL, 'R' },
+    { "phase",       optional_argument, NULL, 'P' },
     { NULL,          0,                 NULL,  0  }
 };
 
@@ -566,8 +572,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
     cfg->rate        = 0;
+    cfg->threads_delay = 1;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:P:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -593,6 +600,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'R':
                 if (scan_metric(optarg, &cfg->rate)) return -1;
+                break;
+            case 'P':
+                if (scan_metric(optarg, &cfg->threads_delay)) return -1;
                 break;
             case 'v':
                 printf("wrk %s [%s] ", VERSION, aeGetApiName());
